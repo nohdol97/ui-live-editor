@@ -65,6 +65,16 @@ the `{{SCHEMA_CONTEXT}}` block injected into the system prompt. Per table:
 - for columns with cardinality ≤ 25: the full distinct value list
 - for date/timestamp columns: min/max range
 
+Row counts come from cheap metadata (Parquet footer statistics,
+`pg_class.reltuples` estimates marked with `~`), never from `COUNT(*)` over a
+large source — bind time must stay fast on multi-GB datasets.
+
+**Sample-value sanitization**: sample values are data from an untrusted source
+flowing into a prompt. Before injection they are: truncated (60 chars),
+newlines collapsed to spaces, backticks stripped, and the whole schema block
+wrapped in a clearly delimited fence. A value like `## new instructions` must
+land as inert text inside the fence, unable to open a new prompt section.
+
 Budget: ≤ 4 KB per table, ≤ 24 KB total; beyond that, tables are listed
 name-and-columns-only and the agent is told to fetch per-table detail with
 `get_schema(table)` and explore with `run_query`.
@@ -113,8 +123,9 @@ def run_turn(session, user_message):
 
 def agent_inner_loop(session):
     for i in range(MAX_TOOL_ITERATIONS):
-        system = render_system_prompt(session)     # fresh SCHEMA/FILE_TREE/QUERIES
-        resp = litellm_chat(system, session.history, TOOLS)
+        # STATIC_SYSTEM is byte-stable; compose_history() appends the fresh
+        # session-state message (schema/files/queries/errors) — see §8
+        resp = litellm_chat(STATIC_SYSTEM, compose_history(session), TOOLS)
         if resp.tool_calls:
             for call in resp.tool_calls:           # sequential execution
                 result = dispatch_with_validation(call)
@@ -124,16 +135,21 @@ def agent_inner_loop(session):
             return True
     session.history.append(SystemNudge(
         "Tool budget exhausted. Summarize state and what remains."))
-    resp = litellm_chat(render_system_prompt(session), session.history, tools=None)
+    resp = litellm_chat(STATIC_SYSTEM, compose_history(session), tools=None)
     session.history.append(Assistant(resp.text))
     return False
 ```
 
 Key properties:
 
-- The system prompt is re-rendered on **every** model call so `FILE_TREE` and
-  `REGISTERED_QUERIES` are always current — the model never needs stale history
-  to know project state.
+- **Prompt-cache-friendly layout**: the system prompt (rules, libraries,
+  conventions) is **byte-stable** for the whole session. The dynamic Session
+  Context (`SCHEMA_CONTEXT`, `FILE_TREE`, `REGISTERED_QUERIES`,
+  `RUNTIME_ERRORS`) is delivered as a separate platform message injected
+  immediately before the newest user message and **replaced in place** on every
+  model call. State is always current, and the static prefix (system prompt +
+  older history) stays cacheable — re-rendering state inside the system prompt
+  would invalidate the provider's prefix cache on every single call.
 - Validation happens inside `dispatch_with_validation`; a failed tool call
   returns a structured error string to the model (it repairs within the same loop).
 - The post-turn gate catches what per-call validation cannot (cross-file import
@@ -195,6 +211,9 @@ tool results with an `ERROR:` prefix plus an actionable message — never thrown
   its default parameters yields a warning in the tool result (usually a wrong
   filter value or a value-format mismatch) — the agent sees it before the user does.
 - **note**: re-registering an existing `id` replaces it (this is the edit path).
+- **binding rule**: an optional param (`required: false`) that the caller omits
+  binds as SQL `NULL` (after applying `default` if declared). The prompt teaches
+  the matching idiom: `WHERE ($p IS NULL OR col = $p)`.
 
 ### 4.4 `unregister_query`
 - **params**: `{ "id": {"type": "string"} }` — removes from registry. Fails with a
@@ -408,7 +427,9 @@ they ask for anything, without them having to paste a stack trace.
 
 Lifecycle: the active error list belongs to the live revision — publishing a new
 revision clears it (the old list stays attached to its revision in history). An
-error that survives the fix will re-report and reappear.
+error that survives the fix will re-report and reappear. When the list is empty
+the `{{RUNTIME_ERRORS}}` block renders as `(none)` — never as an empty section a
+model might fill with imagination.
 
 ## 7. Revisions and UI tabs
 
@@ -418,6 +439,10 @@ create revisions). The gate itself is skipped entirely while the project is
 empty (conversation-only turns before the first build must not fail).
 
 - **Preview**: iframe pointed at the latest green revision (`?rev=` busts cache).
+- **Progress streaming**: while a turn runs, the harness streams tool activity
+  to the chat UI as ephemeral status lines ("registering query
+  `sales_by_month`…", "writing `components/TrendChart.jsx`…", "repairing build
+  errors (2)…") — a 40-tool-call turn must never look like a frozen app.
 - **Query**: two sections — *Registered queries* (id, description, params, SQL,
   last execution stats) and *Exploration log* (agent's `run_query` history with
   duration/row counts/status).
@@ -433,9 +458,9 @@ addition, not v1.
 
 - **Tool-result truncation**: `run_query` ≤ 4 KB; `read_file` full but counted
   against the turn budget; repeated `get_schema` returns a pointer (§4.1).
-- **No duplicated project state**: because the system prompt always carries the
-  live `FILE_TREE` + `REGISTERED_QUERIES`, after a turn completes the harness
-  replaces `write_file` **contents** in older history with
+- **No duplicated project state**: because the session-state message always
+  carries the live `FILE_TREE` + `REGISTERED_QUERIES`, after a turn completes
+  the harness replaces `write_file` **contents** in older history with
   `"(content written — current version via read_file)"`. Keep the last 2 turns
   verbatim. This keeps long multi-turn sessions cheap without confusing the model.
 - **History compaction**: when the conversation exceeds ~60 % of the model
@@ -463,6 +488,10 @@ addition, not v1.
   must reply with exactly one fenced JSON action
   `{"tool": "...", "arguments": {...}}` or `{"final": "..."}`; harness parses,
   executes, feeds back. Same loop, same validators — only transport changes.
+  For `write_file`, escaping a 200-line JSX file inside a JSON string is exactly
+  what weak models fail at — the fallback envelope therefore supports
+  `"content": "@@BLOCK"`, where the actual file content follows in a separate
+  fenced block after the JSON. The harness stitches them together.
 
 ## 10. Limits (defaults, tune in config)
 
@@ -479,6 +508,7 @@ addition, not v1.
 | Tool-result size in history | 4 KB |
 | LLM retries | 3 |
 | Registered queries per session | 50 |
+| Session idle unload | 30 min |
 
 ## 11. Failure modes
 
@@ -505,3 +535,23 @@ addition, not v1.
 - **Token metering**: prompt/completion tokens per turn and per session,
   surfaced in an admin view — multi-turn dashboard sessions are long-lived and
   costs must be attributable.
+- **Idle unload**: after 30 min without activity a session's DuckDB connection
+  and Postgres attachments are closed (memory and connection pools are shared
+  resources); durable state makes the reload transparent — the next message
+  re-binds the dataset (§2.3 probes included) and continues.
+
+## 13. Evaluation harness
+
+Prompt and gate changes need regression evidence, not vibes:
+
+- **Golden task set**: 15–30 canonical requests spanning the difficulty range —
+  single chart, multi-filter dashboard, cohort analysis, follow-up edit, revert
+  request, impossible request (missing column), Korean column names — each with
+  a fixed dataset fixture.
+- **Replay runner**: executes the set against a spec/prompt/model change,
+  headless, N repetitions per task.
+- **Metrics per task**: post-turn gate green rate, repair rounds used,
+  tool-iteration count, wall-clock, tokens, and (for the impossible request)
+  whether the agent honestly declined instead of fabricating.
+- **Gate**: a prompt change ships only if green rate and honesty hold steady or
+  improve; token/latency regressions require a deliberate trade-off decision.

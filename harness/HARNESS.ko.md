@@ -66,6 +66,15 @@ read-only는 3중으로 강제한다:
 - 카디널리티 ≤ 25인 컬럼: 전체 distinct 값 목록
 - date/timestamp 컬럼: min/max 범위
 
+행 수는 저렴한 메타데이터에서 얻는다(Parquet 푸터 통계, `pg_class.reltuples`
+추정치는 `~` 마커 표시). 큰 소스에 `COUNT(*)`를 돌리지 않는다 — 수 GB
+데이터셋에서도 바인딩은 빨라야 한다.
+
+**샘플 값 새니타이즈**: 샘플 값은 신뢰할 수 없는 소스에서 프롬프트로 흘러드는
+데이터다. 주입 전에 절단(60자), 개행은 공백으로 접기, 백틱 제거를 거치고,
+스키마 블록 전체를 명확히 구분된 펜스로 감싼다. `## 새 지시사항` 같은 값은
+펜스 안의 불활성 텍스트로 남아야 하며, 새 프롬프트 섹션을 열 수 없어야 한다.
+
 예산: 테이블당 ≤ 4KB, 전체 ≤ 24KB. 초과 시 테이블은 이름+컬럼만 나열하고
 에이전트에게 `get_schema(table)`로 테이블별 상세를 받고 `run_query`로
 탐색하라고 안내한다.
@@ -113,8 +122,9 @@ def run_turn(session, user_message):
 
 def agent_inner_loop(session):
     for i in range(MAX_TOOL_ITERATIONS):
-        system = render_system_prompt(session)     # SCHEMA/FILE_TREE/QUERIES 항상 최신
-        resp = litellm_chat(system, session.history, TOOLS)
+        # STATIC_SYSTEM은 바이트 단위 고정; compose_history()가 최신
+        # 세션 상태 메시지(스키마/파일/쿼리/에러)를 덧붙인다 — §8 참고
+        resp = litellm_chat(STATIC_SYSTEM, compose_history(session), TOOLS)
         if resp.tool_calls:
             for call in resp.tool_calls:           # 순차 실행
                 result = dispatch_with_validation(call)
@@ -124,16 +134,20 @@ def agent_inner_loop(session):
             return True
     session.history.append(SystemNudge(
         "도구 예산 소진. 현재 상태와 남은 작업을 요약하라."))
-    resp = litellm_chat(render_system_prompt(session), session.history, tools=None)
+    resp = litellm_chat(STATIC_SYSTEM, compose_history(session), tools=None)
     session.history.append(Assistant(resp.text))
     return False
 ```
 
 핵심 성질:
 
-- 시스템 프롬프트는 **매 모델 호출마다** 재렌더링되어 `FILE_TREE`와
-  `REGISTERED_QUERIES`가 항상 최신이다 — 모델이 프로젝트 상태를 알기 위해
-  낡은 히스토리에 의존할 필요가 없다.
+- **프롬프트 캐시 친화적 레이아웃**: 시스템 프롬프트(규칙, 라이브러리, 컨벤션)는
+  세션 내내 **바이트 단위로 고정**된다. 동적 세션 컨텍스트(`SCHEMA_CONTEXT`,
+  `FILE_TREE`, `REGISTERED_QUERIES`, `RUNTIME_ERRORS`)는 최신 사용자 메시지
+  직전에 주입되는 별도 플랫폼 메시지로 전달되며 매 모델 호출마다 **제자리에서
+  교체**된다. 상태는 항상 최신이면서 정적 프리픽스(시스템 프롬프트 + 오래된
+  히스토리)는 캐시 가능하다 — 상태를 시스템 프롬프트 안에서 재렌더링하면
+  매 호출마다 프로바이더의 프리픽스 캐시가 무효화된다.
 - 검증은 `dispatch_with_validation` 안에서 일어난다. 실패한 도구 호출은
   구조화된 에러 문자열로 모델에 돌아가고, 같은 루프 안에서 수리된다.
 - 턴 종료 게이트는 호출 단위 검증이 못 잡는 것(파일 간 import 깨짐,
@@ -193,6 +207,9 @@ VFS 작업 상태는 유지되며, 아무것도 게시되지 않는다.
   남긴다(대개 잘못된 필터 값이나 값 포맷 불일치) — 사용자보다 에이전트가
   먼저 본다.
 - **참고**: 기존 `id` 재등록은 교체를 의미한다 (이것이 수정 경로).
+- **바인딩 규칙**: 호출자가 생략한 선택적 param(`required: false`)은 (선언된
+  `default` 적용 후) SQL `NULL`로 바인딩된다. 프롬프트가 대응 관용구를
+  가르친다: `WHERE ($p IS NULL OR col = $p)`.
 
 ### 4.4 `unregister_query`
 - **params**: `{ "id": {"type": "string"} }` — 레지스트리에서 제거. 프로젝트
@@ -400,7 +417,9 @@ Context 내 `{{RUNTIME_ERRORS}}` 블록으로 주입한다. 프롬프트는 나�
 
 수명주기: 활성 에러 목록은 라이브 리비전에 속한다 — 새 리비전이 게시되면
 비워진다(옛 목록은 해당 리비전에 붙어 히스토리에 남는다). 수정을 버텨낸
-에러는 다시 보고되어 다시 나타난다.
+에러는 다시 보고되어 다시 나타난다. 목록이 비어 있으면 `{{RUNTIME_ERRORS}}`
+블록은 `(none)`으로 렌더링된다 — 모델이 상상으로 채울 수 있는 빈 섹션으로는
+절대 남기지 않는다.
 
 ## 7. 리비전과 UI 탭
 
@@ -410,6 +429,10 @@ Context 내 `{{RUNTIME_ERRORS}}` 블록으로 주입한다. 프롬프트는 나�
 전의 대화 전용 턴이 실패해서는 안 된다).
 
 - **Preview**: 최신 green 리비전을 가리키는 iframe (`?rev=`로 캐시 무효화).
+- **진행 상황 스트리밍**: 턴이 도는 동안 하네스는 도구 활동을 채팅 UI에
+  임시 상태 라인으로 스트리밍한다("쿼리 등록 중: `sales_by_month`…",
+  "`components/TrendChart.jsx` 작성 중…", "빌드 에러 수리 중 (2)…") —
+  도구 호출 40회짜리 턴이 멈춘 앱처럼 보여서는 절대 안 된다.
 - **Query**: 두 섹션 — *등록된 쿼리* (id, description, params, SQL, 최근 실행
   통계)와 *탐색 로그* (에이전트의 `run_query` 이력: 소요 시간/행 수/상태).
 - **Code**: 게시된 리비전의 읽기 전용 파일 트리 + 뷰어, 리비전 선택기로
@@ -424,7 +447,7 @@ v1이 아니다.
 
 - **도구 결과 절단**: `run_query` ≤ 4KB; `read_file`은 전문이되 턴 예산에
   계상; 반복 `get_schema`는 포인터 반환 (§4.1).
-- **프로젝트 상태 중복 제거**: 시스템 프롬프트가 항상 최신 `FILE_TREE` +
+- **프로젝트 상태 중복 제거**: 세션 상태 메시지가 항상 최신 `FILE_TREE` +
   `REGISTERED_QUERIES`를 담고 있으므로, 턴이 완료되면 하네스는 오래된
   히스토리 속 `write_file`의 **내용**을
   `"(content written — current version via read_file)"`로 치환한다. 최근 2턴은
@@ -453,6 +476,10 @@ v1이 아니다.
   tools 비활성화; 도구를 시스템 프롬프트에 기술; 모델은 정확히 하나의 fenced
   JSON 액션 `{"tool": "...", "arguments": {...}}` 또는 `{"final": "..."}`로
   응답; 하네스가 파싱·실행·피드백. 루프와 검증기는 동일 — 전송 방식만 바뀐다.
+  `write_file`의 경우 200줄짜리 JSX 파일을 JSON 문자열 안에 이스케이프하는
+  것이 바로 약한 모델이 실패하는 지점이다 — 그래서 폴백 봉투는
+  `"content": "@@BLOCK"`을 지원하며, 실제 파일 내용은 JSON 뒤의 별도 펜스
+  블록으로 따라온다. 하네스가 둘을 이어 붙인다.
 
 ## 10. 제한값 (기본값, 설정으로 조정)
 
@@ -469,6 +496,7 @@ v1이 아니다.
 | 히스토리 내 도구 결과 크기 | 4KB |
 | LLM 재시도 | 3 |
 | 세션당 등록 쿼리 수 | 50 |
+| 세션 유휴 언로드 | 30분 |
 
 ## 11. 실패 모드
 
@@ -493,3 +521,22 @@ v1이 아니다.
   답할 수 있게 하는 것이 바로 이것이다.
 - **토큰 계측**: 턴별/세션별 prompt/completion 토큰을 관리자 뷰에 표시 —
   멀티 턴 대시보드 세션은 수명이 길어 비용 귀속이 가능해야 한다.
+- **유휴 언로드**: 30분간 활동이 없으면 세션의 DuckDB 연결과 Postgres
+  attachment를 닫는다(메모리와 커넥션 풀은 공유 자원이다); 영속 상태 덕분에
+  리로드는 투명하다 — 다음 메시지가 데이터셋을 재바인딩하고(§2.3 프로브 포함)
+  이어서 진행한다.
+
+## 13. 평가 하네스
+
+프롬프트와 게이트 변경에는 감이 아니라 회귀 증거가 필요하다:
+
+- **골든 태스크 세트**: 난이도 범위를 아우르는 정형 요청 15~30개 — 단일 차트,
+  다중 필터 대시보드, 코호트 분석, 후속 수정, 되돌리기 요청, 불가능한 요청
+  (없는 컬럼), 한글 컬럼명 — 각각 고정된 데이터셋 픽스처와 함께.
+- **리플레이 러너**: 명세/프롬프트/모델 변경에 대해 세트를 헤드리스로 실행,
+  태스크당 N회 반복.
+- **태스크별 지표**: 턴 종료 게이트 green 비율, 사용된 수리 라운드 수, 도구
+  반복 횟수, 소요 시간, 토큰, 그리고 (불가능한 요청의 경우) 에이전트가
+  지어내는 대신 정직하게 거절했는지.
+- **게이트**: green 비율과 정직성이 유지되거나 개선될 때만 프롬프트 변경을
+  배포한다; 토큰/지연 시간 회귀는 의도적인 트레이드오프 결정을 요구한다.
