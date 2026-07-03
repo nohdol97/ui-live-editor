@@ -58,7 +58,9 @@ At session start (cached; rebuilt only if the dataset changes) the harness build
 the `{{SCHEMA_CONTEXT}}` block injected into the system prompt. Per table:
 
 - table name, row count
-- per column: name, type, null fraction
+- per column: name, type, null fraction — names that need quoting (spaces,
+  uppercase, non-ASCII such as Korean) are shown **pre-quoted** (`"주문 금액"`)
+  so the agent copies valid SQL identifiers instead of inventing quoting
 - 3–5 sample values per column (from `USING SAMPLE`, truncated to 60 chars)
 - for columns with cardinality ≤ 25: the full distinct value list
 - for date/timestamp columns: min/max range
@@ -142,6 +144,11 @@ arriving mid-turn are queued and delivered as the next user turn (no mid-turn
 injection in v1). The user can cancel a running turn: in-flight LLM/tool work is
 aborted, the VFS working state is kept, and nothing is published.
 
+**Repair budget**: repair-round inner loops run with a reduced iteration budget
+(`MAX_TOOL_ITERATIONS_REPAIR = 15`, vs 40 for the main loop) — a repair is a
+targeted fix, and without the lower cap a pathological turn could burn
+40 + 3×40 iterations.
+
 ## 4. Tool contracts
 
 All tools are exposed via OpenAI-style function calling. Errors are returned as
@@ -222,6 +229,10 @@ tool results with an `ERROR:` prefix plus an actionable message — never thrown
 4. Reject table functions that read paths/URLs (`read_parquet`, `read_csv*`,
    `read_json*`, `glob`, `httpfs` anything) — the session catalog views are the
    only data entry point.
+4b. Reject introspection/settings functions that can leak host configuration —
+   `duckdb_settings`, `current_setting`, `getenv`, `duckdb_extensions` (an
+   attached Postgres DSN must never be readable through SQL). Plain
+   `information_schema` reads over the session catalog are allowed.
 5. Row cap: wrap as `SELECT * FROM (<q>) LIMIT <cap>` unless an inner LIMIT is
    already smaller. Caps: exploration 200, registered/bridge 10 000.
 6. Parameters bound exclusively via prepared statements — the harness never
@@ -245,6 +256,10 @@ tool results with an `ERROR:` prefix plus an actionable message — never thrown
   verified by the post-turn build gate (§5.3).
 - **index.html**: must contain `<script src="/bridge.js">` before the first module
   script — enforced as an error (the platform depends on load order).
+- **HTML-injection lint** (warning-level): `dangerouslySetInnerHTML` or
+  `.innerHTML =` in project code triggers a warning — data values are untrusted
+  text and the prompt forbids rendering them as HTML. Warning rather than error
+  because static-fixed HTML has legitimate (rare) uses.
 
 ### 5.3 Post-turn gate
 
@@ -356,10 +371,17 @@ Parameter wire formats (JSON over postMessage): `date` = `"YYYY-MM-DD"` string,
 `string[]`/`number[]` = JSON arrays; the parent converts to DuckDB types when
 binding.
 
-Result serialization: `DATE`/`TIMESTAMP` → ISO strings; `BIGINT`/`HUGEINT`/
-`DECIMAL` values outside `Number.MAX_SAFE_INTEGER` → decimal **strings** (never
-silently lose precision); everything else → native JSON types. The prompt tells
-the agent to `CAST(... AS DOUBLE)` in SQL when charts need plain numbers.
+Result serialization: `DATE`/`TIMESTAMP` → ISO strings (timestamps are
+timezone-naive and serialized without an offset); `BIGINT`/`HUGEINT`/`DECIMAL`
+values outside `Number.MAX_SAFE_INTEGER` → decimal **strings** (never silently
+lose precision); `NaN`/`Infinity` → `null` (JSON cannot carry them); everything
+else → native JSON types. The prompt tells the agent to `CAST(... AS DOUBLE)`
+in SQL when charts need plain numbers and to guard against `null`.
+
+**Session isolation**: session ids are unguessable (UUIDv4+). `/artifact/*`
+responses and bridge query execution both verify that the requesting
+authenticated user owns the session — an artifact URL pasted to a colleague
+must not expose someone else's dataset. `/vendor/*` is public and static.
 
 ### 6.4 Runtime error reporting (after publish)
 
@@ -383,6 +405,10 @@ agent turn as the `{{RUNTIME_ERRORS}}` block of the system prompt's Session
 Context. The prompt instructs the agent to fix listed runtime errors as part of
 its next turn — so an error the user triggered at 3 pm is repaired the next time
 they ask for anything, without them having to paste a stack trace.
+
+Lifecycle: the active error list belongs to the live revision — publishing a new
+revision clears it (the old list stays attached to its revision in history). An
+error that survives the fix will re-report and reappear.
 
 ## 7. Revisions and UI tabs
 
@@ -429,6 +455,9 @@ addition, not v1.
   file entering the VFS.
 - **Malformed tool-call JSON**: returned to the model as a parse-error tool result
   (with the parser message), never silently dropped.
+- **Empty response** (no text, no tool calls): nudge once ("Respond to the user
+  or continue with tools"); if empty again, end the turn with a generic
+  "no response produced" message rather than looping.
 - **Fallback for weak tool-calling models** (decide per internal model after
   measurement): disable native tools; describe tools in the system prompt; model
   must reply with exactly one fenced JSON action
@@ -440,7 +469,9 @@ addition, not v1.
 | Knob | Default |
 |---|---|
 | Tool iterations / user turn | 40 |
+| Tool iterations / repair round | 15 |
 | Repair rounds / turn | 3 |
+| DuckDB memory limit / session | 2 GB |
 | Exploration query timeout / row cap | 30 s / 200 rows |
 | Bridge query timeout / row cap | 10 s / 10 000 rows, 5 MB |
 | Bridge concurrency per session | 4 |
@@ -458,3 +489,19 @@ addition, not v1.
 | Query timeout | Error suggests aggregating further / adding filters |
 | LLM endpoint down | Surface to user; conversation and revision state kept |
 | Dataset missing what the user asked for | Agent must say so (prompt rule) — harness adds no magic |
+| Postgres schema drifts mid-session (column dropped/renamed) | Queries fail with missing-column errors; harness rebuilds the schema context on the next turn and prepends a schema-diff notice so the agent adapts instead of retrying blindly |
+
+## 12. Durability and observability
+
+- **Session state is durable**: VFS files, query registry, revisions, runtime
+  errors, and conversation history live in a persistent store (SQLite/Postgres),
+  not in process memory. On harness restart or session resume, DuckDB views are
+  rebuilt from the dataset binding (§2.3 re-probe included) and the session
+  continues where it left off.
+- **Structured logs** per session: every tool call (name, args digest, outcome,
+  duration), every gate result, every executed SQL (with row count and timing),
+  every LLM call (model, latency, finish reason). This is what makes "why did
+  the agent do that" answerable in an internal service.
+- **Token metering**: prompt/completion tokens per turn and per session,
+  surfaced in an admin view — multi-turn dashboard sessions are long-lived and
+  costs must be attributable.
