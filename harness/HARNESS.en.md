@@ -67,6 +67,24 @@ Budget: ≤ 4 KB per table, ≤ 24 KB total; beyond that, tables are listed
 name-and-columns-only and the agent is told to fetch per-table detail with
 `get_schema(table)` and explore with `run_query`.
 
+### 2.3 Dataset bind validation
+
+Data injection is verified at session creation, before the first user message
+is accepted:
+
+1. **Source reachable**: the Parquet file(s) open / the Postgres `ATTACH`
+   succeeds. Failure → session creation fails with the underlying error; a
+   session is never created over a silently empty catalog.
+2. **Every view probes**: `SELECT * FROM <view> LIMIT 1` per exposed table —
+   catches schema drift, permission gaps, and corrupt files at bind time
+   instead of mid-conversation.
+3. **Row counts recorded**: written into the schema context; a 0-row table is
+   flagged there explicitly (`⚠ empty table`) so the agent never builds against
+   data it assumes exists.
+4. **Postgres liveness**: attached sources get a cheap re-probe when a session
+   resumes after idle; a dead connection surfaces as a user-visible session
+   error, not as mysterious query failures.
+
 ## 3. Agent loop
 
 ```python
@@ -163,9 +181,12 @@ tool results with an `ERROR:` prefix plus an actionable message — never thrown
     }}}
   ```
 - **behavior**: SQL gate → placeholder check (every `$name` in SQL must be a
-  declared param and vice versa) → dry-run `EXPLAIN` with defaults/type-appropriate
-  probe values → store in the registry (upsert by `id`). Returns the result columns
-  and types so the agent can wire the UI without guessing.
+  declared param and vice versa) → `EXPLAIN` dry-run → **sample execution**
+  (`LIMIT 5`) with defaults/type-appropriate probe values → store in the registry
+  (upsert by `id`). Returns the result columns, types, and sample row count so
+  the agent can wire the UI without guessing. A query returning **0 rows** with
+  its default parameters yields a warning in the tool result (usually a wrong
+  filter value or a value-format mismatch) — the agent sees it before the user does.
 - **note**: re-registering an existing `id` replaces it (this is the edit path).
 
 ### 4.4 `unregister_query`
@@ -239,6 +260,10 @@ Runs after the agent's inner loop finishes:
    protocol error. The test host page implements the real parent side of the
    bridge (same registry, same validators) so bridge calls execute genuinely.
    Collected messages go back to the agent in the repair prompt.
+4. **Inline-data lint** (warning-level): a file containing a large inline data
+   literal (JSON-ish array/object > 2 KB) triggers a warning back to the agent —
+   dashboard data must come from the bridge, not be baked into code. This is the
+   mechanical backstop for the "never hardcode rows" prompt rule.
 
 Publish policy: **only a green post-turn gate publishes a new revision** to the
 Preview tab. If all repair rounds fail, the previous good revision stays live and
@@ -335,6 +360,29 @@ Result serialization: `DATE`/`TIMESTAMP` → ISO strings; `BIGINT`/`HUGEINT`/
 `DECIMAL` values outside `Number.MAX_SAFE_INTEGER` → decimal **strings** (never
 silently lose precision); everything else → native JSON types. The prompt tells
 the agent to `CAST(... AS DOUBLE)` in SQL when charts need plain numbers.
+
+### 6.4 Runtime error reporting (after publish)
+
+The smoke render only observes the first 5 seconds; errors that occur when the
+user later interacts with the live dashboard (a filter combination that crashes
+a chart, an unhandled empty result) would otherwise vanish. `bridge.js` closes
+this loop: in the published preview it hooks `window.onerror`,
+`unhandledrejection`, and `console.error`, deduplicates, and reports batches to
+the parent:
+
+```jsonc
+// child → parent
+{ "type": "ui-live:client-error", "errors": [
+    { "message": "Cannot read properties of null (reading 'setOption')",
+      "source": "components/TrendChart.jsx:41", "count": 3 } ] }
+```
+
+The parent stores them **per revision** (deduplicated, capped at 20), shows an
+error badge on the Preview tab, and injects the unresolved list into the next
+agent turn as the `{{RUNTIME_ERRORS}}` block of the system prompt's Session
+Context. The prompt instructs the agent to fix listed runtime errors as part of
+its next turn — so an error the user triggered at 3 pm is repaired the next time
+they ask for anything, without them having to paste a stack trace.
 
 ## 7. Revisions and UI tabs
 

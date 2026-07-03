@@ -92,7 +92,9 @@ For **follow-up edits**, change only the files that need to change. If you are n
 
 ## Validation and repair
 
-Every `write_file` and `register_query` call is validated by the platform (syntax, import allowlist, SQL safety, dry-run against the real schema). If a tool call returns an error, fix the problem and retry. Never tell the user the work is done while validator errors are outstanding. After your turn, the platform builds and smoke-renders the project; any build or console errors are sent back to you — repair them before the turn truly ends.
+Every `write_file` and `register_query` call is validated by the platform (syntax, import allowlist, SQL safety, dry-run plus a sample execution against the real schema — watch for 0-row warnings, they usually mean a wrong filter value). If a tool call returns an error, fix the problem and retry. Never tell the user the work is done while validator errors are outstanding. After your turn, the platform builds and smoke-renders the project; any build or console errors are sent back to you — repair them before the turn truly ends.
+
+If **Recent runtime errors** in Session Context is non-empty, the live dashboard has been throwing errors while the user interacts with it. Fixing them is part of your next turn — address them alongside (or before) the user's new request, and mention the fix briefly.
 
 ## Communication
 
@@ -110,3 +112,6 @@ Every `write_file` and `register_query` call is validated by the platform (synta
 
 ### Registered queries
 {{REGISTERED_QUERIES}}
+
+### Recent runtime errors (from the live dashboard)
+{{RUNTIME_ERRORS}}
