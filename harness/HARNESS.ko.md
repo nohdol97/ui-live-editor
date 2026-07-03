@@ -65,7 +65,8 @@ read-only는 3중으로 강제한다:
 - date/timestamp 컬럼: min/max 범위
 
 예산: 테이블당 ≤ 4KB, 전체 ≤ 24KB. 초과 시 테이블은 이름+컬럼만 나열하고
-에이전트에게 `run_query`로 탐색하라고 안내한다.
+에이전트에게 `get_schema(table)`로 테이블별 상세를 받고 `run_query`로
+탐색하라고 안내한다.
 
 ## 3. 에이전트 루프
 
@@ -78,18 +79,18 @@ def run_turn(session, user_message):
 
     finished = agent_inner_loop(session)           # ── 1단계: 에이전트 작업
 
-    for _ in range(MAX_REPAIR_ROUNDS):             # ── 2단계: 수리 루프
+    for attempt in range(MAX_REPAIR_ROUNDS + 1):   # ── 2단계: 게이트 + 수리
         errors = post_turn_gate(session)           # 빌드 + 스모크 렌더 (§5.3)
         if not errors:
+            publish_revision(session)              # ── 3단계: 게시 (§7)
+            break
+        if attempt == MAX_REPAIR_ROUNDS:
+            notify_user_kept_last_good_revision(session)   # 아무것도 게시 안 됨
             break
         session.history.append(ToolStyleNotice(
             "PLATFORM VALIDATION FAILED:\n" + format(errors) +
             "\n지금 이 문제들을 고쳐라. 해결 전에는 사용자에게 응답하지 마라."))
         agent_inner_loop(session)
-    else:
-        notify_user_kept_last_good_revision(session)
-
-    publish_revision(session)                      # ── 3단계: 게시 (§7)
 
 def agent_inner_loop(session):
     for i in range(MAX_TOOL_ITERATIONS):

@@ -64,7 +64,8 @@ the `{{SCHEMA_CONTEXT}}` block injected into the system prompt. Per table:
 - for date/timestamp columns: min/max range
 
 Budget: ≤ 4 KB per table, ≤ 24 KB total; beyond that, tables are listed
-name-and-columns-only and the agent is told to explore with `run_query`.
+name-and-columns-only and the agent is told to fetch per-table detail with
+`get_schema(table)` and explore with `run_query`.
 
 ## 3. Agent loop
 
@@ -77,18 +78,18 @@ def run_turn(session, user_message):
 
     finished = agent_inner_loop(session)           # ── phase 1: agent works
 
-    for _ in range(MAX_REPAIR_ROUNDS):             # ── phase 2: repair loop
+    for attempt in range(MAX_REPAIR_ROUNDS + 1):   # ── phase 2: gate + repair
         errors = post_turn_gate(session)           # build + smoke render (§5.3)
         if not errors:
+            publish_revision(session)              # ── phase 3: publish (§7)
+            break
+        if attempt == MAX_REPAIR_ROUNDS:
+            notify_user_kept_last_good_revision(session)   # nothing published
             break
         session.history.append(ToolStyleNotice(
             "PLATFORM VALIDATION FAILED:\n" + format(errors) +
             "\nFix these issues now. Do not reply to the user until resolved."))
         agent_inner_loop(session)
-    else:
-        notify_user_kept_last_good_revision(session)
-
-    publish_revision(session)                      # ── phase 3: publish (§7)
 
 def agent_inner_loop(session):
     for i in range(MAX_TOOL_ITERATIONS):
