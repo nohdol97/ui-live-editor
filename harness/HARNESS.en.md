@@ -129,10 +129,13 @@ All tools are exposed via OpenAI-style function calling. Errors are returned as
 tool results with an `ERROR:` prefix plus an actionable message — never thrown.
 
 ### 4.1 `get_schema`
-- **params**: `{}`
-- **returns**: the same content as `{{SCHEMA_CONTEXT}}`. If unchanged since the
-  last call, returns `"Schema unchanged — see the system prompt Session Context."`
-  (saves tokens).
+- **params**: `{ "table": {"type": "string", "description": "optional — full detail for one table"} }`
+- **returns**: without `table`, the same content as `{{SCHEMA_CONTEXT}}` (if
+  unchanged since the last call, returns `"Schema unchanged — see the system
+  prompt Session Context."` to save tokens). With `table`, the **full** detail
+  for that table (all columns, samples, cardinality, ranges) even when the
+  global context was truncated to names-only for size — this is the escape
+  hatch for wide/many-table datasets.
 
 ### 4.2 `run_query` — agent-side exploration only
 - **params**:
@@ -264,6 +267,11 @@ explain this to the user).
   file), pinned versions only. Recommended baseline set: `react`, `react-dom`,
   `echarts`, `date-fns` (adjust to taste; keep the list short — every entry grows
   the prompt and the attack surface).
+- The `{{ALLOWED_LIBRARIES}}` block injected into the system prompt lists, per
+  library: bare specifier, pinned version, and a **minimal idiomatic usage
+  snippet** (5–10 lines) — most importantly the ECharts-inside-React pattern
+  (`useRef` + `echarts.init` in `useEffect`, cleanup with `dispose`, resize via
+  observer). This one snippet eliminates the most common first-turn failure class.
 
 ### 6.2 Sandbox
 
@@ -306,7 +314,10 @@ Parent-side enforcement per request:
   `type` values are ignored (the parent replies with `targetOrigin: "*"` — an
   opaque origin cannot be targeted more precisely, which is why source checking
   matters);
-- `queryId` must be registered **in this session**;
+- `queryId` is resolved against the **published revision's query snapshot**, not
+  the mutable working registry — while the agent reworks queries during a turn,
+  the dashboard the user is looking at keeps executing the versions it was
+  published with;
 - params validated against the declared types (missing required → error;
   undeclared params → error);
 - execution via prepared statement, 10 s timeout, result cap 10 000 rows / 5 MB;
@@ -319,9 +330,17 @@ Parameter wire formats (JSON over postMessage): `date` = `"YYYY-MM-DD"` string,
 `string[]`/`number[]` = JSON arrays; the parent converts to DuckDB types when
 binding.
 
+Result serialization: `DATE`/`TIMESTAMP` → ISO strings; `BIGINT`/`HUGEINT`/
+`DECIMAL` values outside `Number.MAX_SAFE_INTEGER` → decimal **strings** (never
+silently lose precision); everything else → native JSON types. The prompt tells
+the agent to `CAST(... AS DOUBLE)` in SQL when charts need plain numbers.
+
 ## 7. Revisions and UI tabs
 
-Each green post-turn gate snapshots `{files, queries}` as revision *n*.
+Each green post-turn gate snapshots `{files, queries}` as revision *n* —
+**only if something changed** (pure Q&A turns that touch no files/queries do not
+create revisions). The gate itself is skipped entirely while the project is
+empty (conversation-only turns before the first build must not fail).
 
 - **Preview**: iframe pointed at the latest green revision (`?rev=` busts cache).
 - **Query**: two sections — *Registered queries* (id, description, params, SQL,

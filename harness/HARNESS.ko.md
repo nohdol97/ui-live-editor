@@ -130,9 +130,12 @@ VFS 작업 상태는 유지되며, 아무것도 게시되지 않는다.
 않고 `ERROR:` 접두사 + 조치 가능한 메시지로 도구 결과에 담아 반환한다.
 
 ### 4.1 `get_schema`
-- **params**: `{}`
-- **returns**: `{{SCHEMA_CONTEXT}}`와 동일한 내용. 직전 호출 이후 변경이 없으면
-  `"Schema unchanged — see the system prompt Session Context."` 반환 (토큰 절약).
+- **params**: `{ "table": {"type": "string", "description": "선택 — 특정 테이블의 전체 상세"} }`
+- **returns**: `table` 없이 호출하면 `{{SCHEMA_CONTEXT}}`와 동일한 내용 (직전
+  호출 이후 변경이 없으면 토큰 절약을 위해 `"Schema unchanged — see the system
+  prompt Session Context."` 반환). `table`을 넘기면 전역 컨텍스트가 크기 때문에
+  이름만으로 절단됐더라도 해당 테이블의 **전체** 상세(모든 컬럼, 샘플,
+  카디널리티, 범위)를 반환한다 — 넓은/많은 테이블 데이터셋의 탈출구다.
 
 ### 4.2 `run_query` — 에이전트 탐색 전용
 - **params**:
@@ -264,6 +267,11 @@ VFS 작업 상태는 유지되며, 아무것도 게시되지 않는다.
   ESM 파일로 빌드), 고정 버전만. 권장 기본 세트: `react`, `react-dom`,
   `echarts`, `date-fns` (취향껏 조정하되 목록은 짧게 — 항목 하나하나가
   프롬프트와 공격 표면을 키운다).
+- 시스템 프롬프트에 주입되는 `{{ALLOWED_LIBRARIES}}` 블록은 라이브러리별로
+  bare specifier, 고정 버전, 그리고 **최소한의 관용 사용 스니펫**(5~10줄)을
+  담는다 — 특히 React 안에서의 ECharts 패턴(`useRef` + `useEffect`에서
+  `echarts.init`, `dispose`로 정리, observer로 resize)이 중요하다. 이 스니펫
+  하나가 첫 턴 실패의 가장 흔한 부류를 제거한다.
 
 ### 6.2 샌드박스
 
@@ -305,7 +313,9 @@ postMessage 봉투 (child ↔ parent):
 - `event.source === iframe.contentWindow`일 때만 메시지 수락; 모르는 `type`은
   무시 (부모는 `targetOrigin: "*"`로 응답한다 — opaque origin은 더 정밀하게
   지정할 수 없으므로, 그래서 source 검사가 중요하다);
-- `queryId`는 **이 세션에** 등록된 것이어야 함;
+- `queryId`는 변경 가능한 작업 중 레지스트리가 아니라 **게시된 리비전의 쿼리
+  스냅샷**에 대해 해석된다 — 에이전트가 턴 진행 중에 쿼리를 재작업하는 동안,
+  사용자가 보고 있는 대시보드는 게시 당시의 쿼리 버전을 계속 실행한다;
 - params는 선언된 타입에 대해 검증 (필수 누락 → 에러; 미선언 param → 에러);
 - prepared statement로 실행, 10초 타임아웃, 결과 상한 10,000행 / 5MB;
 - 세션당 동시 실행 ≤ 4 — **초과분은 `bridge.js`가 클라이언트 측에서 큐잉**한다
@@ -316,9 +326,17 @@ postMessage 봉투 (child ↔ parent):
 파라미터 와이어 포맷 (postMessage 위의 JSON): `date` = `"YYYY-MM-DD"` 문자열,
 `string[]`/`number[]` = JSON 배열; 바인딩 시 부모가 DuckDB 타입으로 변환한다.
 
+결과 직렬화: `DATE`/`TIMESTAMP` → ISO 문자열; `Number.MAX_SAFE_INTEGER`를 넘는
+`BIGINT`/`HUGEINT`/`DECIMAL` 값 → 십진 **문자열** (정밀도를 조용히 잃는 일은
+없다); 그 외 → 네이티브 JSON 타입. 차트에 순수 숫자가 필요하면 SQL에서
+`CAST(... AS DOUBLE)`하라고 프롬프트가 에이전트에게 지시한다.
+
 ## 7. 리비전과 UI 탭
 
-턴 종료 게이트가 green일 때마다 `{files, queries}`를 리비전 *n*으로 스냅샷.
+턴 종료 게이트가 green일 때마다 `{files, queries}`를 리비전 *n*으로 스냅샷 —
+**단, 무언가 변경됐을 때만** (파일/쿼리를 건드리지 않는 순수 Q&A 턴은 리비전을
+만들지 않는다). 프로젝트가 비어 있는 동안에는 게이트 자체를 건너뛴다 (첫 빌드
+전의 대화 전용 턴이 실패해서는 안 된다).
 
 - **Preview**: 최신 green 리비전을 가리키는 iframe (`?rev=`로 캐시 무효화).
 - **Query**: 두 섹션 — *등록된 쿼리* (id, description, params, SQL, 최근 실행
