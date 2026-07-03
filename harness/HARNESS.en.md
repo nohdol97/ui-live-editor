@@ -118,6 +118,11 @@ Key properties:
 - The post-turn gate catches what per-call validation cannot (cross-file import
   breakage, runtime/console errors).
 
+**Turn concurrency and cancellation**: one active turn per session. User messages
+arriving mid-turn are queued and delivered as the next user turn (no mid-turn
+injection in v1). The user can cancel a running turn: in-flight LLM/tool work is
+aborted, the VFS working state is kept, and nothing is published.
+
 ## 4. Tool contracts
 
 All tools are exposed via OpenAI-style function calling. Errors are returned as
@@ -205,9 +210,14 @@ tool results with an `ERROR:` prefix plus an actionable message — never thrown
 - **size**: ≤ 200 KB per file, ≤ 40 files per project.
 - **syntax**: esbuild parse check (`loader: jsx` for `.js/.jsx`, plus html/css/json
   checks). Errors returned verbatim (file:line:message).
-- **imports** (js/jsx): each specifier must be (a) relative and inside the project,
-  or (b) an exact key of the import map allowlist. Anything else → error listing
-  the allowed names.
+- **imports** (js/jsx): each specifier must be (a) a relative path (`./x`, `../x`)
+  ending in `.js` or `.jsx` that stays inside the project after normalization, or
+  (b) an exact key of the import map allowlist. Anything else → error listing the
+  allowed names. CSS imports from JS are rejected (browser modules cannot load
+  CSS; the prompt directs the agent to `<link>` tags).
+  **This is a form check only** — whether the target file exists is deliberately
+  NOT checked at write time (files may be written in any order); existence is
+  verified by the post-turn build gate (§5.3).
 - **index.html**: must contain `<script src="/bridge.js">` before the first module
   script — enforced as an error (the platform depends on load order).
 
@@ -222,7 +232,9 @@ Runs after the agent's inner loop finishes:
    match a registered query id.
 3. **Smoke render** (recommended, can be phase 2): headless Chromium loads the
    preview for 5 s; fail on any uncaught exception, console.error, or bridge
-   protocol error. Collected messages go back to the agent in the repair prompt.
+   protocol error. The test host page implements the real parent side of the
+   bridge (same registry, same validators) so bridge calls execute genuinely.
+   Collected messages go back to the agent in the repair prompt.
 
 Publish policy: **only a green post-turn gate publishes a new revision** to the
 Preview tab. If all repair rounds fail, the previous good revision stays live and
@@ -231,17 +243,27 @@ explain this to the user).
 
 ## 6. Serving, sandbox, and the data bridge
 
-### 6.1 Serving
+### 6.1 Serving and publish-time compilation
 
+- **Publishing a revision compiles it.** Every `.jsx` file (and `.js` containing
+  JSX) is transpiled with esbuild (`transform` API — per-file, the module graph is
+  preserved, no bundling). Compiled output is stored under the **original source
+  path** and served with `Content-Type: text/javascript`, so specifiers like
+  `./components/Chart.jsx` keep working verbatim and no import-rewriting pass is
+  needed. The Code tab always shows the agent's source, never the compiled output.
 - VFS served at `GET /artifact/{session_id}/{path}` from the **published revision**
   (not the working copy).
+- All `/artifact` and `/vendor` responses carry `Access-Control-Allow-Origin: *`:
+  the sandboxed iframe runs with an opaque origin (no `allow-same-origin`), so its
+  module fetches arrive with `Origin: null` and would otherwise fail CORS.
 - At serve time the harness injects into `index.html`'s `<head>`:
   - the **import map** (bare specifiers → `/vendor/<lib>@<pinned>/...`), and
   - CSP meta (defense in depth alongside the HTTP header).
-- Allowed libraries are self-hosted under `/vendor/`, pinned versions only.
-  Recommended baseline set: `react`, `react-dom`, `echarts`, `date-fns`
-  (adjust to taste; keep the list short — every entry grows the prompt and the
-  attack surface).
+- Allowed libraries are self-hosted under `/vendor/` as **pre-bundled ESM builds**
+  (browsers cannot load CJS — build each lib once with esbuild into a single ESM
+  file), pinned versions only. Recommended baseline set: `react`, `react-dom`,
+  `echarts`, `date-fns` (adjust to taste; keep the list short — every entry grows
+  the prompt and the attack surface).
 
 ### 6.2 Sandbox
 
@@ -280,12 +302,22 @@ postMessage envelope (child ↔ parent):
 ```
 
 Parent-side enforcement per request:
+- messages accepted only when `event.source === iframe.contentWindow`; unknown
+  `type` values are ignored (the parent replies with `targetOrigin: "*"` — an
+  opaque origin cannot be targeted more precisely, which is why source checking
+  matters);
 - `queryId` must be registered **in this session**;
 - params validated against the declared types (missing required → error;
   undeclared params → error);
 - execution via prepared statement, 10 s timeout, result cap 10 000 rows / 5 MB;
-- concurrency ≤ 4 in-flight per session, simple rate limit (≥ 50 ms between requests);
+- concurrency ≤ 4 in-flight per session — **`bridge.js` queues excess requests
+  client-side** (a dashboard with six charts firing on load must degrade to
+  sequential loading, not to errors);
 - every bridge execution is appended to the Query tab log.
+
+Parameter wire formats (JSON over postMessage): `date` = `"YYYY-MM-DD"` string,
+`string[]`/`number[]` = JSON arrays; the parent converts to DuckDB types when
+binding.
 
 ## 7. Revisions and UI tabs
 
@@ -297,6 +329,11 @@ Each green post-turn gate snapshots `{files, queries}` as revision *n*.
   duration/row counts/status).
 - **Code**: read-only file tree + viewer of the published revision, with a
   revision picker for diffing/rollback.
+
+Restoring an old revision is a **UI action** (picker → restore copies that
+snapshot into the working state and republishes). When the user asks the *agent*
+to revert, it simply rebuilds; a `restore_revision` tool is a possible later
+addition, not v1.
 
 ## 8. Context management
 
@@ -318,6 +355,12 @@ Each green post-turn gate snapshots `{files, queries}` as revision *n*.
 - Retries: 3 with exponential backoff on 5xx/timeout; on hard failure the user
   gets an honest error and session state is preserved.
 - Tool calls executed sequentially even if the model emits several in one message.
+- **Truncated output** (`finish_reason: "length"` while emitting a tool call): the
+  partial call is discarded and the model gets an error result — "output was
+  truncated; write smaller files / split this file" — rather than a half-written
+  file entering the VFS.
+- **Malformed tool-call JSON**: returned to the model as a parse-error tool result
+  (with the parser message), never silently dropped.
 - **Fallback for weak tool-calling models** (decide per internal model after
   measurement): disable native tools; describe tools in the system prompt; model
   must reply with exactly one fenced JSON action
